@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aegis-verify"
+version = "0.1.0"
+description = "AI 검증 구조 툴킷 — 정직한 자기개선(AEGIS 루프) + 다른-모델 judge (held-out·다양성·결정론 게이트)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "shoo99" }]
+keywords = ["llm", "agents", "verification", "llm-judge", "rag", "self-improvement", "evaluation"]
+dependencies = []
+
+[project.scripts]
+aegis = "aegis.loop:main"
+
+[tool.setuptools]
+packages = ["aegis"]
