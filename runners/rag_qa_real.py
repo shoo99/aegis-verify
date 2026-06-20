@@ -1,85 +1,62 @@
-"""AEGIS runner — *실제* RAG QA (Qdrant + ollama + 다른-모델 judge).
+"""AEGIS runner — paper-rag(shoo99/paper-rag) 실연결.
 
-rag_qa.py(SIM 데모)의 실전 버전. 네 논문 코퍼스(Qdrant)에서 검색 → ollama로 답변 →
-*다른 모델* judge로 근거 대조. 이 답변/judge 품질이 낮은 케이스가 곧 프롬프트 개선 신호.
+paper-rag의 rag.py를 그대로 import해서 *그들의* hybrid 검색(dense+sparse+RRF+리랭크+dedup)과
+ollama LLM으로 답한 뒤, **다른 모델** judge(aegis.verify)로 근거를 대조한다.
+최적화 대상(PROMPT) = paper-rag answer()의 (원래 하드코딩된) 시스템 프롬프트.
 
-▶ 실행(보통 ollama·Qdrant 있는 머신=RTX 박스에서):
-    QDRANT_COLLECTION=my_papers OLLAMA_MODEL=qwen3:8b \
+▶ 실행 (paper-rag·ollama 있는 머신 = RTX 박스에서):
+    PAPER_RAG_PATH=~/paper-rag RAG_DB=./rag_qdrant JUDGE_MODEL=qwen3:14b \
     AEGIS_BACKEND=ollama python3 -m aegis.loop runners/rag_qa_real.py --rounds 3
 
-환경변수(전부 선택, 기본값 아래):
-    QDRANT_URL=http://localhost:6333   QDRANT_COLLECTION=papers
-    OLLAMA_URL=http://localhost:11434   OLLAMA_MODEL=qwen3:8b
-    EMBED_MODEL=bge-m3                  # 코퍼스 색인에 쓴 임베딩과 *반드시 일치*
-    JUDGE_MODEL=qwen3:14b              # 답변 모델과 *다른* 모델(self-grade 금지)
-    RAG_TOPK=4   TEXT_FIELD=text        # Qdrant payload의 본문 필드명
+환경변수:
+    PAPER_RAG_PATH  paper-rag 디렉토리(기본 ~/paper-rag)
+    JUDGE_MODEL     근거 대조 judge 모델 — 답변 LLM(RAG_LLM)과 *반드시 다르게*(기본 qwen3:14b)
+    그 외 검색/모델/DB = paper-rag rag.py의 env 그대로(RAG_DB·RAG_LLM·RAG_EMBED·RAG_DEDUP…)
 
-EVAL_CASES = runners/eval_cases.json (네가 채움): [{"id","q","gold?"}]
-  gold 있으면 '그 값이 답에 포함 + judge 통과'면 OK. 없으면 'judge 무플래그'면 OK.
+EVAL_CASES = runners/eval_cases.json — 네 논문 질문 + (선택) gold. 근거에 *없는* 질문도 넣어 환각 유도.
 """
 import json
 import os
 import pathlib
-import urllib.request
+import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
 PROMPT_PATH = str(HERE / "rag_qa_real_prompt.txt")
-
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
-QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "papers")
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
-JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "qwen3:14b")
-TOPK = int(os.environ.get("RAG_TOPK", "4"))
-TEXT_FIELD = os.environ.get("TEXT_FIELD", "text")
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "qwen3:14b")   # 답변 LLM과 다른 모델(self-grade 금지)
 
 
-def _http_json(url, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.loads(r.read().decode())
+def _rag():
+    """paper-rag의 rag.py 모듈 지연 import."""
+    p = os.path.expanduser(os.environ.get("PAPER_RAG_PATH", "~/paper-rag"))
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    import rag
+    return rag
 
 
-def _embed(text):
-    """ollama 임베딩(/api/embeddings). 코퍼스 색인과 같은 EMBED_MODEL이어야 검색이 맞음."""
-    return _http_json(f"{OLLAMA_URL}/api/embeddings", {"model": EMBED_MODEL, "prompt": text})["embedding"]
+def _ctx(hits):
+    return "\n\n".join(f"[{i+1}] ({h['source']} p.{h['page']}) {h['text']}" for i, h in enumerate(hits))
 
 
-def retrieve(question, k=TOPK):
-    """Qdrant 벡터검색 → 상위 k passage 텍스트. ▶ paper-rag가 자체 retriever를 노출하면 그걸로 교체."""
+def run_case(prompt, case):
     try:
-        from qdrant_client import QdrantClient
-    except ImportError:
-        raise SystemExit("qdrant-client 필요: pip install qdrant-client (RAG 머신에서 실행)")
-    cli = QdrantClient(url=QDRANT_URL)
-    hits = cli.search(collection_name=QDRANT_COLLECTION, query_vector=_embed(question), limit=k)
-    return [h.payload.get(TEXT_FIELD, "") for h in hits if h.payload]
-
-
-def generate(prompt, question, passages):
-    """ollama 답변 생성: [시스템 프롬프트] + 검색 근거 + 질문."""
-    full = f"{prompt}\n\n[근거]\n" + "\n---\n".join(passages) + f"\n\n[질문]\n{question}\n\n[답변]\n"
-    out = _http_json(f"{OLLAMA_URL}/api/generate",
-                     {"model": OLLAMA_MODEL, "prompt": full, "stream": False})
-    return (out.get("response") or "").strip()
-
-
-def check(case, answer, passages):
-    """다른-모델 judge(aegis.verify)로 답변 claim을 근거와 대조 + gold 포함 확인."""
-    from aegis import verify
-    evidence = "\n---\n".join(passages)
-    v = verify(answer, evidence, model=JUDGE_MODEL, backend="ollama")
-    gold_ok = (str(case["gold"]) in answer) if case.get("gold") else True
-    ok = v["ok"] and gold_ok
-    note = ""
-    if not gold_ok:
-        note = f"missing: gold '{case['gold']}' 답에 없음(근거검색·프롬프트 점검)"
-    elif not v["ok"]:
-        flags = "; ".join(f"{f['verdict']}:{f['claim'][:40]}" for f in v["flagged"][:3])
-        note = f"missing: 근거 미지지 claim — {flags}"
-    return ok, note
+        rag = _rag()
+        hits = rag.curate(case["q"])                    # 그들 hybrid 검색 + dedup + budget-fit
+        if not hits:
+            return {"ok": False, "output": "", "note": "missing: 검색 0건(색인/질문 점검)"}
+        ctx = _ctx(hits)
+        ans = rag.llm(prompt, f"CONTEXT:\n{ctx}\n\nQUESTION: {case['q']}")   # prompt=최적화 대상 시스템 프롬프트
+        from aegis import verify
+        v = verify(ans, ctx, model=JUDGE_MODEL, backend="ollama")           # 다른-모델 judge
+        gold_ok = (str(case["gold"]) in ans) if case.get("gold") else True
+        if not gold_ok:
+            return {"ok": False, "output": ans, "note": f"missing: gold '{case['gold']}' 답에 없음"}
+        if not v["ok"]:
+            flags = "; ".join(f"{f['verdict']}:{f['claim'][:40]}" for f in v["flagged"][:3])
+            return {"ok": False, "output": ans, "note": f"missing: 근거 미지지 claim — {flags}"}
+        return {"ok": True, "output": ans, "note": ""}
+    except Exception as e:
+        return {"ok": False, "output": "", "note": f"runtime: {type(e).__name__}: {str(e)[:90]}"}
 
 
 def _load_cases():
@@ -90,15 +67,3 @@ def _load_cases():
 
 
 EVAL_CASES = _load_cases()
-
-
-def run_case(prompt, case):
-    try:
-        passages = retrieve(case["q"])
-        ans = generate(prompt, case["q"], passages)
-        ok, note = check(case, ans, passages)
-        return {"ok": ok, "output": ans, "note": note}
-    except SystemExit:
-        raise
-    except Exception as e:
-        return {"ok": False, "output": "", "note": f"runtime: {type(e).__name__}: {str(e)[:80]}"}
