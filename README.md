@@ -27,6 +27,11 @@ python3 -m aegis.loop runners/mock_keywords.py --stub-evolve
 
 # 실제: claude가 실패 보고 프롬프트 개선 제안 → holdout 게이트가 채택 판단(드라이런, --apply로 출시)
 python3 -m aegis.loop runners/rag_qa.py --rounds 3
+
+# 실(real) RAG — Qdrant 코퍼스 + ollama + 다른-모델 judge (ollama/Qdrant 있는 머신에서)
+#   runners/eval_cases.json 채우고, 환경변수로 컬렉션/모델 지정 → README의 runners/rag_qa_real.py 참고
+QDRANT_COLLECTION=my_papers OLLAMA_MODEL=qwen3:8b AEGIS_BACKEND=ollama \
+  python3 -m aegis.loop runners/rag_qa_real.py --rounds 3
 ```
 
 러너 계약 3개만 정의하면 어떤 에이전트에도 붙는다:
